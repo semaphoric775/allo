@@ -667,6 +667,14 @@ def build(
     if target == "simulator":
         s = customize(func)
         return LLVMOMPModule(s.module, s.top_func_name)
+    if target in {"xls", "xlscc"}:
+        # pylint: disable=import-outside-toplevel
+        from .backend.xls_dataflow import XLSDataflowModule
+
+        s = customize(func, enable_tensor=enable_tensor)
+        return XLSDataflowModule(
+            s.module, s.top_func_name, project=project, mode=mode, configs=configs
+        )
     # FPGA backend (vitis_hls, vivado_hls, tapa, ihls, catapult)
     s = customize(func, enable_tensor=enable_tensor)
     hls_mod = s.build(

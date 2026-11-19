@@ -57,6 +57,12 @@ public:
   void emitSelect(arith::SelectOp op) override;
   void emitConstant(arith::ConstantOp op) override;
   template <typename CastOpType> void emitCast(CastOpType op);
+  /// Emit the source operand of a cast to `result`. Backends whose integer
+  /// types lack implicit conversions (e.g. XLS) override this.
+  virtual void emitCastOperand(Value operand, Value result) {
+    (void)result;
+    emitValue(operand);
+  }
   void emitGeneralCast(mlir::UnrealizedConversionCastOp op) override;
   void emitGetBit(allo::GetIntBitOp op) override;
   void emitSetBit(allo::SetIntBitOp op) override;

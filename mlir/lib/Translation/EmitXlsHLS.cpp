@@ -13,9 +13,11 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/AffineExprVisitor.h"
 #include "mlir/IR/IntegerSet.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/Tools/mlir-translate/Translation.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
@@ -228,6 +230,115 @@ static void emitFlattenedAffineIndexHelper(raw_ostream &os,
   }
 }
 
+/// Bank layout of a partitioned memref. Allo's partition primitive sets a
+/// layout map with 2*rank results: the bank index of each dim followed by the
+/// address of each dim within its bank.
+struct BankInfo {
+  AffineMap layout;
+  SmallVector<int64_t, 4> factors;   // banks per dim
+  SmallVector<int64_t, 4> bankShape; // extent of each dim within a bank
+  int64_t numBanks = 1;
+  int64_t bankSize = 1;
+  bool partitioned() const { return layout && numBanks > 1; }
+  /// Completely partitioned: every element is its own bank (registers).
+  bool registers() const { return partitioned() && bankSize == 1; }
+};
+
+static BankInfo getBankInfo(Type type) {
+  BankInfo info;
+  auto memrefType = llvm::dyn_cast<MemRefType>(type);
+  if (!memrefType || memrefType.getLayout().isIdentity())
+    return info;
+  // Streams (StringAttr memory space) are channels, never banked.
+  if (llvm::isa_and_nonnull<StringAttr>(memrefType.getMemorySpace()))
+    return info;
+  auto map = memrefType.getLayout().getAffineMap();
+  unsigned rank = memrefType.getRank();
+  if (map.getNumResults() != 2 * rank)
+    return info;
+  // Number of distinct values `expr` takes over a dim of extent n.
+  auto extent = [](AffineExpr expr, int64_t n) -> int64_t {
+    if (llvm::isa<AffineConstantExpr>(expr))
+      return 1;
+    if (auto bin = llvm::dyn_cast<AffineBinaryOpExpr>(expr))
+      if (auto cst = llvm::dyn_cast<AffineConstantExpr>(bin.getRHS())) {
+        int64_t c = cst.getValue();
+        if (expr.getKind() == AffineExprKind::Mod)
+          return std::min(c, n);
+        if (expr.getKind() == AffineExprKind::FloorDiv)
+          return (n + c - 1) / c;
+      }
+    return n; // identity (complete partition / unpartitioned address)
+  };
+  for (unsigned d = 0; d < rank; ++d) {
+    int64_t n = memrefType.getShape()[d];
+    info.factors.push_back(extent(map.getResult(d), n));
+    info.bankShape.push_back(extent(map.getResult(d + rank), n));
+    info.numBanks *= info.factors.back();
+    info.bankSize *= info.bankShape.back();
+  }
+  info.layout = map;
+  return info;
+}
+
+/// Linearized (bank, address) expressions of an access through `access`.
+static std::pair<AffineExpr, AffineExpr> getBankAndAddr(const BankInfo &info,
+                                                        AffineMap access) {
+  AffineMap composed = info.layout.compose(access);
+  unsigned rank = info.factors.size();
+  MLIRContext *ctx = access.getContext();
+  AffineExpr bank = getAffineConstantExpr(0, ctx);
+  AffineExpr addr = getAffineConstantExpr(0, ctx);
+  for (unsigned d = 0; d < rank; ++d) {
+    bank = bank * info.factors[d] + composed.getResult(d);
+    addr = addr * info.bankShape[d] + composed.getResult(d + rank);
+  }
+  unsigned nd = composed.getNumDims(), ns = composed.getNumSymbols();
+  return {simplifyAffineExpr(bank, nd, ns), simplifyAffineExpr(addr, nd, ns)};
+}
+
+/// Print an affine expression as C++; `names` holds dims then symbols.
+static std::string printAffine(AffineExpr expr, ArrayRef<std::string> names,
+                               unsigned numDims) {
+  if (auto cst = llvm::dyn_cast<AffineConstantExpr>(expr))
+    return std::to_string(cst.getValue());
+  if (auto dim = llvm::dyn_cast<AffineDimExpr>(expr))
+    return names[dim.getPosition()];
+  if (auto sym = llvm::dyn_cast<AffineSymbolExpr>(expr))
+    return names[numDims + sym.getPosition()];
+  auto bin = llvm::cast<AffineBinaryOpExpr>(expr);
+  std::string lhs = printAffine(bin.getLHS(), names, numDims);
+  std::string rhs = printAffine(bin.getRHS(), names, numDims);
+  switch (expr.getKind()) {
+  case AffineExprKind::Add:
+    return "(" + lhs + " + " + rhs + ")";
+  case AffineExprKind::Mul:
+    return "(" + lhs + " * " + rhs + ")";
+  case AffineExprKind::Mod:
+    return "(" + lhs + " % " + rhs + ")";
+  case AffineExprKind::FloorDiv:
+    return "(" + lhs + " / " + rhs + ")";
+  default: // CeilDiv
+    return "((" + lhs + " + " + rhs + " - 1) / " + rhs + ")";
+  }
+}
+
+static std::string bankName(StringRef base, int64_t bank) {
+  return (base + "_b" + Twine(bank)).str();
+}
+
+/// Map from a linear (row-major) index d0 to the indices of `shape`.
+static AffineMap getDelinearizeMap(ArrayRef<int64_t> shape, MLIRContext *ctx) {
+  SmallVector<AffineExpr, 4> results;
+  int64_t stride = 1;
+  for (int64_t d = shape.size() - 1; d >= 0; --d) {
+    results.insert(results.begin(),
+                   getAffineDimExpr(0, ctx).floorDiv(stride) % shape[d]);
+    stride *= shape[d];
+  }
+  return AffineMap::get(1, 0, results, ctx);
+}
+
 } // anonymous namespace
 
 namespace mlir {
@@ -237,6 +348,239 @@ namespace hls {
 //===----------------------------------------------------------------------===//
 // XLS-specific implementations
 //===----------------------------------------------------------------------===//
+
+std::string allo::hls::XlsModuleEmitter::partitionedReadExpr(
+    Value memref, AffineMap map, ArrayRef<std::string> operandNames) {
+  BankInfo info = getBankInfo(memref.getType());
+  if (!USE_MEMORY_FLAG || !info.partitioned())
+    return "";
+  std::string base = getName(memref).str().str();
+  unsigned nd = map.getNumDims();
+  std::string expr;
+  if (info.registers()) {
+    expr = base;
+    for (auto idx : map.getResults())
+      expr += "[" + printAffine(idx, operandNames, nd) + "]";
+    return expr;
+  }
+  auto [bank, addr] = getBankAndAddr(info, map);
+  std::string a = "[" + printAffine(addr, operandNames, nd) + "]";
+  if (auto cst = llvm::dyn_cast<AffineConstantExpr>(bank))
+    return bankName(base, cst.getValue()) + a;
+  // Bank only known at runtime: select among the banks.
+  std::string b = printAffine(bank, operandNames, nd);
+  for (int64_t k = 0; k + 1 < info.numBanks; ++k)
+    expr += "(" + b + " == " + std::to_string(k) + ") ? " + bankName(base, k) +
+            a + " : ";
+  return expr + bankName(base, info.numBanks - 1) + a;
+}
+
+bool allo::hls::XlsModuleEmitter::emitPartitionedStore(
+    Value memref, AffineMap map, ArrayRef<std::string> operandNames,
+    StringRef valueStr) {
+  BankInfo info = getBankInfo(memref.getType());
+  if (!USE_MEMORY_FLAG || !info.partitioned())
+    return false;
+  std::string base = getName(memref).str().str();
+  unsigned nd = map.getNumDims();
+  indent();
+  if (info.registers()) {
+    os << base;
+    for (auto idx : map.getResults())
+      os << "[" << printAffine(idx, operandNames, nd) << "]";
+    os << " = " << valueStr << ";";
+    return true;
+  }
+  auto [bank, addr] = getBankAndAddr(info, map);
+  std::string a = "[" + printAffine(addr, operandNames, nd) + "]";
+  if (auto cst = llvm::dyn_cast<AffineConstantExpr>(bank)) {
+    os << bankName(base, cst.getValue()) << a << " = " << valueStr << ";";
+    return true;
+  }
+  std::string b = printAffine(bank, operandNames, nd);
+  for (int64_t k = 0; k < info.numBanks; ++k) {
+    if (k > 0)
+      os << " else ";
+    if (k + 1 < info.numBanks)
+      os << "if (" << b << " == " << k << ") ";
+    os << "{ " << bankName(base, k) << a << " = " << valueStr << "; }";
+  }
+  return true;
+}
+
+bool allo::hls::XlsModuleEmitter::emitPartitionedDecl(Value memref,
+                                                      StringRef name) {
+  BankInfo info = getBankInfo(memref.getType());
+  if (!USE_MEMORY_FLAG || !info.partitioned())
+    return false;
+  auto memrefType = llvm::cast<MemRefType>(memref.getType());
+  auto elemType = getXLSTypeName(memrefType.getElementType());
+  if (info.registers()) {
+    // Wrapper declares a class-level array (registers persist across states)
+    os << "// __xls_array_decl__: " << elemType << ", " << name;
+    for (int64_t dim : memrefType.getShape())
+      os << ", " << dim;
+    return true;
+  }
+  int64_t memorySpace = 0;
+  if (auto intAttr =
+          llvm::dyn_cast_or_null<IntegerAttr>(memrefType.getMemorySpace()))
+    memorySpace = intAttr.getInt();
+  for (int64_t k = 0; k < info.numBanks; ++k) {
+    if (k > 0) {
+      os << "\n";
+      indent();
+    }
+    os << "// __xls_memory_decl__: " << elemType << ", " << info.bankSize
+       << ", " << bankName(name, k) << ", " << memorySpace << ", "
+       << info.bankSize;
+  }
+  return true;
+}
+
+SmallVector<std::string, 4>
+allo::hls::XlsModuleEmitter::getOperandNames(ValueRange values) {
+  SmallVector<std::string, 4> names;
+  for (Value v : values) {
+    IntegerAttr cst;
+    if (matchPattern(v, m_Constant(&cst)))
+      names.push_back(std::to_string(cst.getInt()));
+    else
+      names.push_back(getName(v).str().str());
+  }
+  return names;
+}
+
+// Bit ops use an unsigned working copy one bit wider than the operand so that
+// masks of the full width do not overflow.
+static std::string intCastType(Type t) {
+  auto it = llvm::cast<IntegerType>(t);
+  return "ac_int<" + std::to_string(it.getWidth()) + ", " +
+         (it.getSignedness() == IntegerType::Unsigned ? "false" : "true") + ">";
+}
+
+static std::string bitsType(Value v, int extra = 1) {
+  return "ac_int<" +
+         std::to_string(v.getType().getIntOrFloatBitWidth() + extra) +
+         ", false>";
+}
+
+void allo::hls::XlsModuleEmitter::emitGetBit(allo::GetIntBitOp op) {
+  indent();
+  Value result = op.getResult();
+  fixUnsignedType(result, op->hasAttr("unsigned"));
+  emitValue(result);
+  os << " = ((" << bitsType(op.getNum()) << "("
+     << getOperandNames(op.getNum())[0] << ") >> "
+     << getOperandNames(op.getIndex())[0] << ") & 1);";
+  emitInfoAndNewLine(op);
+}
+
+void allo::hls::XlsModuleEmitter::emitSetBit(allo::SetIntBitOp op) {
+  std::string t = bitsType(op.getNum());
+  std::string idx = getOperandNames(op.getIndex())[0];
+  indent();
+  Value result = op.getResult();
+  emitValue(result);
+  os << " = " << intCastType(result.getType()) << "((" << t << "("
+     << getOperandNames(op.getNum())[0] << ") & ~(" << t << "(1) << " << idx
+     << ")) | (" << t << "(" << getOperandNames(op.getVal())[0] << " & 1) << "
+     << idx << "));";
+  emitInfoAndNewLine(op);
+}
+
+void allo::hls::XlsModuleEmitter::emitGetSlice(allo::GetIntSliceOp op) {
+  std::string t = bitsType(op.getNum());
+  std::string hi = getOperandNames(op.getHi())[0];
+  std::string lo = getOperandNames(op.getLo())[0];
+  indent();
+  Value result = op.getResult();
+  fixUnsignedType(result, op->hasAttr("unsigned"));
+  emitValue(result);
+  // bits [hi:lo] inclusive
+  os << " = " << intCastType(result.getType()) << "((" << t << "("
+     << getOperandNames(op.getNum())[0] << ") >> " << lo << ") & ((" << t
+     << "(1) << (" << hi << " - " << lo << " + 1)) - 1));";
+  emitInfoAndNewLine(op);
+}
+
+void allo::hls::XlsModuleEmitter::emitSetSlice(allo::SetIntSliceOp op) {
+  std::string t = bitsType(op.getNum());
+  std::string hi = getOperandNames(op.getHi())[0];
+  std::string lo = getOperandNames(op.getLo())[0];
+  std::string mask =
+      "(((" + t + "(1) << (" + hi + " - " + lo + " + 1)) - 1) << " + lo + ")";
+  indent();
+  Value result = op.getResult();
+  emitValue(result);
+  os << " = " << intCastType(result.getType()) << "((" << t << "("
+     << getOperandNames(op.getNum())[0] << ") & ~" << mask << ") | ((" << t
+     << "(" << bitsType(op.getVal(), 0) << "("
+     << getOperandNames(op.getVal())[0] << ")) << " << lo << ") & " << mask
+     << "));";
+  emitInfoAndNewLine(op);
+}
+
+void allo::hls::XlsModuleEmitter::emitCastOperand(Value operand, Value result) {
+  auto toInt = [](Type t) -> IntegerType {
+    if (llvm::isa<IndexType>(t)) // index is emitted as int
+      return IntegerType::get(t.getContext(), 32, IntegerType::Signed);
+    return llvm::dyn_cast<IntegerType>(t);
+  };
+  IntegerType dst = toInt(result.getType());
+  if (!dst || !toInt(operand.getType())) {
+    emitValue(operand);
+    return;
+  }
+  bool isSigned = dst.getSignedness() != IntegerType::Unsigned;
+  os << "ac_int<" << dst.getWidth() << ", " << (isSigned ? "true" : "false")
+     << ">(";
+  emitValue(operand);
+  os << ")";
+}
+
+std::string
+allo::hls::XlsModuleEmitter::accessExpr(Value memref, AffineMap map,
+                                        ArrayRef<std::string> operandNames) {
+  std::string banked = partitionedReadExpr(memref, map, operandNames);
+  if (!banked.empty())
+    return banked;
+  auto shape = llvm::cast<MemRefType>(memref.getType()).getShape();
+  unsigned nd = map.getNumDims();
+  std::string expr = getName(memref).str().str();
+  if (USE_MEMORY_FLAG && shape.size() > 1) { // flattened __xls_memory
+    expr += "[";
+    int64_t stride = 1;
+    for (int64_t d = shape.size() - 1; d >= 0; --d) {
+      expr += (d == (int64_t)shape.size() - 1 ? "" : " + ") + std::string("(") +
+              printAffine(map.getResult(d), operandNames, nd) + ") * " +
+              std::to_string(stride);
+      stride *= shape[d];
+    }
+    return expr + "]";
+  }
+  for (auto idx : map.getResults())
+    expr += "[" + printAffine(idx, operandNames, nd) + "]";
+  return expr;
+}
+
+void allo::hls::XlsModuleEmitter::emitMaskSet(
+    Value memref, AffineMap map, ArrayRef<std::string> operandNames) {
+  auto it = outputMask.find(memref);
+  if (it == outputMask.end())
+    return;
+  auto shape = llvm::cast<MemRefType>(memref.getType()).getShape();
+  std::string idx = "0";
+  int64_t stride = 1;
+  for (int64_t d = shape.size() - 1; d >= 0; --d) {
+    idx += " + (" +
+           printAffine(map.getResult(d), operandNames, map.getNumDims()) +
+           ") * " + std::to_string(stride);
+    stride *= shape[d];
+  }
+  indent();
+  os << it->second << "[" << idx << "] = 1;\n";
+}
 
 SmallString<16> allo::hls::XlsModuleEmitter::getTypeName(Type valType) {
   return getXLSTypeName(valType);
@@ -330,11 +674,13 @@ void allo::hls::XlsModuleEmitter::emitArrayDecl(Value array, bool isFunc,
 
     // DEFAULT MEMREF -> either skip (if USE_MEMORY_FLAG, wrapper handles it)
     // or plain C array: T name[d0][d1]...
-    if (USE_MEMORY_FLAG) {
+    if (USE_MEMORY_FLAG && memref.getRank() > 0) { // scalars stay registers
       // Memory mode: Don't emit declaration here - wrapper will add
       // __xls_memory at class level Just register the name so subsequent uses
       // work
       addName(array, /*isPtr=*/false, name);
+      if (emitPartitionedDecl(array, getName(array)))
+        return;
       // Emit a comment placeholder so the wrapper knows about this array
       int64_t totalSize = 1;
       for (int64_t dim : shape)
@@ -482,11 +828,13 @@ void allo::hls::XlsModuleEmitter::emitLoopDirectives(Operation *op) {
   // Check if explicit unroll directive is present (with optional factor)
   if (auto factor = getLoopDirective(op, "unroll")) {
     indent();
-    os << "#pragma hls_unroll yes";
+    // xlscc syntax: "hls_unroll yes" (full) or "hls_unroll <factor>"
     auto val = llvm::cast<IntegerAttr>(factor).getValue();
-    if (val != 0) {
-      os << " factor=" << val;
-    }
+    os << "#pragma hls_unroll ";
+    if (val != 0)
+      os << val;
+    else
+      os << "yes";
     os << "\n";
   } else {
     // Default: fully unroll the loop
@@ -506,6 +854,41 @@ void allo::hls::XlsModuleEmitter::emitAffineFor(AffineForOp op) {
   // Memory mode compute state: emit normal for loops with local declarations
   // (The state machine 'i' is only used for loading/output, not compute loops)
   // Fall through to register mode loop emission for compute state
+  // Promote loop-invariant read-modify-write accesses of RAMs to registers.
+  SmallVector<std::pair<AffineStoreOp, std::string>, 2> writeBacks;
+  if (USE_MEMORY_FLAG) {
+    llvm::MapVector<Value, SmallVector<Operation *, 2>> accesses;
+    op.getBody()->walk([&](Operation *inner) {
+      for (Value v : inner->getOperands())
+        if (llvm::isa<MemRefType>(v.getType()) && op.isDefinedOutsideOfLoop(v))
+          accesses[v].push_back(inner);
+    });
+    for (auto &[memref, ops] : accesses) {
+      if (ops.size() != 2)
+        continue;
+      auto load = dyn_cast<AffineLoadOp>(ops[0]);
+      auto store = dyn_cast<AffineStoreOp>(ops[1]);
+      if (!load || !store || load->getBlock() != op.getBody() ||
+          store->getBlock() != op.getBody() ||
+          load.getAffineMap() != store.getAffineMap() ||
+          load.getMapOperands() != store.getMapOperands() ||
+          llvm::isa_and_nonnull<StringAttr>(
+              llvm::cast<MemRefType>(memref.getType()).getMemorySpace()) ||
+          !llvm::all_of(load.getMapOperands(),
+                        [&](Value v) { return op.isDefinedOutsideOfLoop(v); }))
+        continue;
+      std::string acc = "acc_" + std::to_string(accumulatorOf.size());
+      indent();
+      os << getXLSTypeName(load.getResult().getType()) << " " << acc << " = "
+         << accessExpr(memref, load.getAffineMap(),
+                       getOperandNames(load.getMapOperands()))
+         << "; // register-promoted accumulator\n";
+      accumulatorOf[load] = acc;
+      accumulatorOf[store] = acc;
+      writeBacks.push_back({store, acc});
+    }
+  }
+
   // Emit loop directives BEFORE the loop (unroll first, then pipeline)
   emitLoopDirectives(op);
 
@@ -571,6 +954,18 @@ void allo::hls::XlsModuleEmitter::emitAffineFor(AffineForOp op) {
 
   indent();
   os << "}\n";
+
+  for (auto &[store, acc] : writeBacks) {
+    auto names = getOperandNames(store.getMapOperands());
+    if (!emitPartitionedStore(store.getMemRef(), store.getAffineMap(), names,
+                              acc)) {
+      indent();
+      os << accessExpr(store.getMemRef(), store.getAffineMap(), names) << " = "
+         << acc << ";";
+    }
+    os << "\n";
+    emitMaskSet(store.getMemRef(), store.getAffineMap(), names);
+  }
 }
 
 void allo::hls::XlsModuleEmitter::emitScfFor(scf::ForOp op) {
@@ -705,6 +1100,19 @@ void allo::hls::XlsModuleEmitter::emitFlattenedIndex(
 }
 
 void allo::hls::XlsModuleEmitter::emitLoad(memref::LoadOp op) {
+  auto rank = op.getIndices().size();
+  std::string banked = partitionedReadExpr(
+      op.getMemRef(), AffineMap::getMultiDimIdentityMap(rank, op.getContext()),
+      getOperandNames(op.getIndices()));
+  if (!banked.empty()) {
+    indent();
+    Value result = op.getResult();
+    fixUnsignedType(result, op->hasAttr("unsigned"));
+    emitValue(result);
+    os << " = " << banked << ";";
+    emitInfoAndNewLine(op);
+    return;
+  }
   indent();
   Value result = op.getResult();
   fixUnsignedType(result, op->hasAttr("unsigned"));
@@ -747,6 +1155,23 @@ void allo::hls::XlsModuleEmitter::emitLoad(memref::LoadOp op) {
 }
 
 void allo::hls::XlsModuleEmitter::emitStore(memref::StoreOp op) {
+  emitStoreImpl(op);
+  emitMaskSet(op.getMemRef(),
+              AffineMap::getMultiDimIdentityMap(op.getIndices().size(),
+                                                op.getContext()),
+              getOperandNames(op.getIndices()));
+}
+
+void allo::hls::XlsModuleEmitter::emitStoreImpl(memref::StoreOp op) {
+  auto rank = op.getIndices().size();
+  if (emitPartitionedStore(
+          op.getMemRef(),
+          AffineMap::getMultiDimIdentityMap(rank, op.getContext()),
+          getOperandNames(op.getIndices()),
+          getOperandNames(op.getValueToStore())[0])) {
+    emitInfoAndNewLine(op);
+    return;
+  }
   indent();
 
   auto memref = op.getMemRef();
@@ -788,6 +1213,25 @@ void allo::hls::XlsModuleEmitter::emitStore(memref::StoreOp op) {
 }
 
 void allo::hls::XlsModuleEmitter::emitAffineLoad(AffineLoadOp op) {
+  if (auto it = accumulatorOf.find(op); it != accumulatorOf.end()) {
+    indent();
+    Value result = op.getResult();
+    emitValue(result);
+    os << " = " << it->second << ";";
+    emitInfoAndNewLine(op);
+    return;
+  }
+  std::string banked = partitionedReadExpr(
+      op.getMemRef(), op.getAffineMap(), getOperandNames(op.getMapOperands()));
+  if (!banked.empty()) {
+    indent();
+    Value result = op.getResult();
+    fixUnsignedType(result, op->hasAttr("unsigned"));
+    emitValue(result);
+    os << " = " << banked << ";";
+    emitInfoAndNewLine(op);
+    return;
+  }
   indent();
   std::string load_from_name = "";
   if (op->hasAttr("from")) {
@@ -839,6 +1283,26 @@ void allo::hls::XlsModuleEmitter::emitAffineLoad(AffineLoadOp op) {
 }
 
 void allo::hls::XlsModuleEmitter::emitAffineStore(AffineStoreOp op) {
+  emitAffineStoreImpl(op);
+  if (!accumulatorOf.count(op))
+    emitMaskSet(op.getMemRef(), op.getAffineMap(),
+                getOperandNames(op.getMapOperands()));
+}
+
+void allo::hls::XlsModuleEmitter::emitAffineStoreImpl(AffineStoreOp op) {
+  if (auto it = accumulatorOf.find(op); it != accumulatorOf.end()) {
+    indent();
+    os << it->second << " = " << getOperandNames(op.getValueToStore())[0]
+       << ";";
+    emitInfoAndNewLine(op);
+    return;
+  }
+  if (emitPartitionedStore(op.getMemRef(), op.getAffineMap(),
+                           getOperandNames(op.getMapOperands()),
+                           getOperandNames(op.getValueToStore())[0])) {
+    emitInfoAndNewLine(op);
+    return;
+  }
   indent();
   std::string store_to_name = "";
   if (op->hasAttr("to")) {
@@ -939,8 +1403,31 @@ void allo::hls::XlsModuleEmitter::emitFunction(func::FuncOp func) {
     }
   }
 
+  // Dataflow kernels: stream arguments become channels and written array
+  // arguments become outputs. Every channel is announced to the Python wrapper
+  // through a "__xls_chan_decl__" comment.
+  bool isKernel = func->hasAttr("df.kernel");
+  auto isWritten = [](Value array) {
+    return llvm::any_of(array.getUsers(), [&](Operation *user) {
+      if (auto st = dyn_cast<AffineStoreOp>(user))
+        return st.getMemRef() == array;
+      if (auto st = dyn_cast<memref::StoreOp>(user))
+        return st.getMemRef() == array;
+      return false;
+    });
+  };
+  auto isRead = [](Value array) {
+    return llvm::any_of(array.getUsers(), [&](Operation *user) {
+      return !isa<AffineStoreOp, memref::StoreOp>(user);
+    });
+  };
+  SmallVector<std::pair<Value, std::string>, 4> streamArgs;
+  for (auto [i, arg] : llvm::enumerate(func.getArguments()))
+    if (llvm::isa<StreamType>(arg.getType()))
+      streamArgs.push_back({arg, "s" + std::to_string(i)});
+
   // If function has array arguments, convert to void function with local arrays
-  if (hasArrayArgs || returnIsArray) {
+  if (hasArrayArgs || returnIsArray || !streamArgs.empty()) {
     // Clear and set up state
     arrayArgToLocalName.clear();
     arrayArgToChannelName.clear();
@@ -979,7 +1466,9 @@ void allo::hls::XlsModuleEmitter::emitFunction(func::FuncOp func) {
       // Declare local array - emit comment placeholder if USE_MEMORY_FLAG
       // (wrapper handles class-level decl)
       indent();
-      if (USE_MEMORY_FLAG) {
+      if (emitPartitionedDecl(arg, localName)) {
+        os << "\n";
+      } else if (USE_MEMORY_FLAG) {
         // Memory mode: emit comment placeholder for wrapper to parse
         // Wrapper will add __xls_memory at class level
         // Format: elem_type, size, name, memory_space, dim0, dim1, ...
@@ -1011,6 +1500,68 @@ void allo::hls::XlsModuleEmitter::emitFunction(func::FuncOp func) {
       argIdx++;
     }
 
+    auto chanDeclT = [&](StringRef type, StringRef name, StringRef dir) {
+      indent();
+      os << "// __xls_chan_decl__: " << type << ", " << name << ", " << dir
+         << "\n";
+    };
+    auto chanDecl = [&](Type elemType, StringRef name, StringRef dir) {
+      chanDeclT(getXLSTypeName(elemType), name, dir);
+    };
+    // Outputs merged from several writers ("xls_masked_outputs" = arg indices)
+    llvm::SmallDenseSet<unsigned, 4> maskedArgs;
+    if (auto attr = func->getAttrOfType<StringAttr>("xls_masked_outputs"))
+      for (StringRef idx : llvm::split(attr.getValue(), ','))
+        if (!idx.empty())
+          maskedArgs.insert(std::stoi(idx.str()));
+    for (auto &[arg, name] : streamArgs) {
+      auto streamType = llvm::cast<StreamType>(arg.getType());
+      if (llvm::isa<ShapedType>(streamType.getBaseType()))
+        emitError(func, "XLS backend does not support streams of blocks");
+      bool gets = llvm::any_of(
+          arg.getUsers(), [](Operation *u) { return isa<StreamGetOp>(u); });
+      bool puts = llvm::any_of(
+          arg.getUsers(), [](Operation *u) { return isa<StreamPutOp>(u); });
+      if (gets && puts)
+        emitError(func, "stream argument is both read and written");
+      addName(arg, /*isPtr=*/false, name);
+      chanDecl(streamType.getBaseType(), name, gets ? "In" : "Out");
+    }
+    // Arrays loaded from input channels / written to output channels.
+    SmallVector<Value, 4> loadedArgs;
+    SmallVector<std::pair<Value, std::string>, 2> outputs;
+    for (auto &arg : arrayArgs) {
+      auto elemType = llvm::cast<ShapedType>(arg.getType()).getElementType();
+      if (!isKernel || isRead(arg)) {
+        loadedArgs.push_back(arg);
+        if (isKernel)
+          chanDecl(elemType, arrayArgToChannelName[arg], "In");
+      }
+      if (isKernel && isWritten(arg)) {
+        std::string chan = arrayArgToLocalName[arg] + "_out";
+        outputs.push_back({arg, chan});
+        unsigned argNo = llvm::cast<BlockArgument>(arg).getArgNumber();
+        if (!maskedArgs.count(argNo)) {
+          chanDecl(elemType, chan, "Out");
+          continue;
+        }
+        // {written, data} on a channel one bit wider than the element
+        unsigned width =
+            elemType.isIndex() ? 32 : elemType.getIntOrFloatBitWidth();
+        int64_t size = llvm::cast<ShapedType>(arg.getType()).getNumElements();
+        std::string mask = arrayArgToLocalName[arg] + "_m";
+        outputMask[arg] = mask;
+        chanDeclT("ac_int<" + std::to_string(width + 1) + ", false>", chan,
+                  "Out");
+        indent();
+        if (USE_MEMORY_FLAG)
+          os << "// __xls_memory_decl__: ac_int<1, false>, " << size << ", "
+             << mask << ", 0, " << size << "\n";
+        else
+          os << "ac_int<1, false> " << mask << "[" << size << "];\n";
+      }
+    }
+
     // Populate arrays from channels
     if (USE_MEMORY_FLAG) {
       // Memory mode: Generate state-based code with pipelined for loops
@@ -1021,7 +1572,7 @@ void allo::hls::XlsModuleEmitter::emitFunction(func::FuncOp func) {
 
       // Generate state-based code for loading each input array
       unsigned stateNum = 0;
-      for (auto &arg : arrayArgs) {
+      for (auto &arg : loadedArgs) {
         auto st = llvm::cast<ShapedType>(arg.getType());
         auto shape = st.getShape();
         std::string localName = arrayArgToLocalName[arg];
@@ -1048,8 +1599,14 @@ void allo::hls::XlsModuleEmitter::emitFunction(func::FuncOp func) {
         indent();
         os << "for (int _i = 0; _i < " << totalSize << "; _i++) {\n";
         addIndent();
-        indent();
-        os << localName << "[_i] = " << channelName << ".read();\n";
+        SmallVector<std::string, 1> linear{"_i"};
+        AffineMap delin = getDelinearizeMap(shape, arg.getContext());
+        std::string readVal = channelName + ".read()";
+        if (!emitPartitionedStore(arg, delin, linear, readVal)) {
+          indent();
+          os << localName << "[_i] = " << readVal << ";";
+        }
+        os << "\n";
         reduceIndent();
         indent();
         os << "}\n";
@@ -1063,7 +1620,7 @@ void allo::hls::XlsModuleEmitter::emitFunction(func::FuncOp func) {
       }
     } else {
       // Register mode: Use for loops
-      for (auto &arg : arrayArgs) {
+      for (auto &arg : loadedArgs) {
         auto st = llvm::cast<ShapedType>(arg.getType());
         auto shape = st.getShape();
         std::string localName = arrayArgToLocalName[arg];
@@ -1125,141 +1682,102 @@ void allo::hls::XlsModuleEmitter::emitFunction(func::FuncOp func) {
                                 .getValue()
                                 .str();
       }
+      outputs.insert(outputs.begin(), {returnValue, outputChannelName});
     }
 
+    // Write every element of `array` to channel `chan`, in row-major order.
+    auto emitWriteOut = [&](Value array, StringRef chan) {
+      auto shape = llvm::cast<ShapedType>(array.getType()).getShape();
+      int64_t totalSize = 1;
+      for (int64_t dim : shape)
+        totalSize *= dim;
+      SmallVector<std::string, 1> linear{"_i"};
+      std::string elem =
+          (USE_MEMORY_FLAG && !getBankInfo(array.getType()).partitioned())
+              ? getName(array).str().str() + "[_i]"
+              : accessExpr(array, getDelinearizeMap(shape, func.getContext()),
+                           linear);
+      indent();
+      os << "#pragma hls_pipeline_init_interval 1\n";
+      indent();
+      os << "for (int _i = 0; _i < " << totalSize << "; _i++) {\n";
+      addIndent();
+      indent();
+      if (auto it = outputMask.find(array); it != outputMask.end()) {
+        auto elemType =
+            llvm::cast<ShapedType>(array.getType()).getElementType();
+        unsigned width =
+            elemType.isIndex() ? 32 : elemType.getIntOrFloatBitWidth();
+        std::string wide = "ac_int<" + std::to_string(width + 1) + ", false>";
+        os << chan << ".write((" << wide << "(" << it->second << "[_i]) << "
+           << width << ") | " << wide << "(ac_int<" << width << ", false>("
+           << elem << ")));\n";
+      } else {
+        os << chan << ".write(" << elem << ");\n";
+      }
+      reduceIndent();
+      indent();
+      os << "}\n";
+    };
+    auto emitMaskClear = [&]() {
+      for (auto &[array, mask] : outputMask) {
+        int64_t size = llvm::cast<ShapedType>(array.getType()).getNumElements();
+        indent();
+        os << "#pragma hls_pipeline_init_interval 1\n";
+        indent();
+        os << "for (int _i = 0; _i < " << size << "; _i++) " << mask
+           << "[_i] = 0;\n";
+      }
+    };
+
     // Calculate compute and output state numbers
-    unsigned computeState = arrayArgs.size();
-    unsigned outputState = computeState + (returnIsArray ? 1 : 0);
+    unsigned computeState = loadedArgs.size();
+    unsigned outputState = computeState + 1;
+    Block &block = func.front();
 
     if (USE_MEMORY_FLAG) {
       // Memory mode: Generate state-based compute and output
-
       // Compute state: Execute function body with normal for loops
       indent();
       os << "// State " << computeState << ": Compute\n";
       indent();
-      os << "else if (state == " << computeState << ") {\n";
+      os << (computeState == 0 ? "if" : "else if")
+         << " (state == " << computeState << ") {\n";
       addIndent();
-
-      // Emit the function body - loops will emit as normal for loops with local
-      // declarations
-      Block &block = func.front();
+      emitMaskClear();
       VhlsModuleEmitter::emitBlock(block);
-
-      // After compute completes, transition to output state (or back to 0 if no
-      // output)
+      // After compute completes, go to the output state (or back to 0)
       indent();
-      unsigned nextState = returnIsArray ? outputState : 0;
-      os << "state = " << nextState << ";\n";
-
+      os << "state = " << (outputs.empty() ? 0 : outputState) << ";\n";
       reduceIndent();
       indent();
       os << "}\n\n";
 
-      // Output state: Write return array to channel using pipelined for loop
-      if (returnIsArray && returnValue) {
-        auto terminator = block.getTerminator();
-        if (auto returnOp = dyn_cast<func::ReturnOp>(terminator)) {
-          for (auto operand : returnOp.getOperands()) {
-            if (operand == returnValue) {
-              auto returnType = llvm::cast<ShapedType>(returnValue.getType());
-              auto shape = returnType.getShape();
-              int64_t totalSize = 1;
-              for (int64_t dim : shape)
-                totalSize *= dim;
-
-              indent();
-              os << "// State " << outputState << ": Output\n";
-              indent();
-              os << "else { // state == " << outputState << "\n";
-              addIndent();
-              indent();
-              os << "#pragma hls_pipeline_init_interval 1\n";
-              indent();
-              os << "for (int _i = 0; _i < " << totalSize << "; _i++) {\n";
-              addIndent();
-              indent();
-              os << outputChannelName << ".write(";
-              emitValue(returnValue);
-              os << "[_i]);\n";
-              reduceIndent();
-              indent();
-              os << "}\n";
-              indent();
-              os << "state = 0;\n";
-              reduceIndent();
-              indent();
-              os << "}\n";
-              break;
-            }
-          }
-        }
+      // Output state: write every output array to its channel
+      if (!outputs.empty()) {
+        indent();
+        os << "// State " << outputState << ": Output\n";
+        indent();
+        os << "else { // state == " << outputState << "\n";
+        addIndent();
+        for (auto &[array, chan] : outputs)
+          emitWriteOut(array, chan);
+        indent();
+        os << "state = 0;\n";
+        reduceIndent();
+        indent();
+        os << "}\n";
       }
     } else {
       // Register mode: Use normal function body and loops
-      // Emit the function body
-      Block &block = func.front();
+      emitMaskClear();
       VhlsModuleEmitter::emitBlock(block);
-
-      // Handle return value: write array to output channel
-      if (returnIsArray && returnValue) {
-        auto terminator = block.getTerminator();
-        if (auto returnOp = dyn_cast<func::ReturnOp>(terminator)) {
-          for (auto operand : returnOp.getOperands()) {
-            if (operand == returnValue) {
-              auto returnType = llvm::cast<ShapedType>(returnValue.getType());
-              auto shape = returnType.getShape();
-              int64_t totalSize = 1;
-              for (int64_t dim : shape)
-                totalSize *= dim;
-
-              // Emit loop to write to output channel
-              indent();
-              os << "#pragma hls_pipeline_init_interval 1\n";
-              indent();
-              os << "for (int _idx = 0; _idx < " << totalSize
-                 << "; ++_idx) {\n";
-              addIndent();
-              indent();
-
-              // Generate array access with proper indexing
-              os << outputChannelName << ".write(";
-              emitValue(returnValue);
-              if (shape.size() == 1) {
-                os << "[_idx]";
-              } else {
-                // Register mode with multi-dimensional: compute indices
-                for (size_t i = 0; i < shape.size(); ++i) {
-                  os << "[";
-                  if (i == shape.size() - 1) {
-                    os << "_idx % " << shape[i];
-                  } else {
-                    int64_t divisor = 1;
-                    for (size_t j = i + 1; j < shape.size(); ++j) {
-                      divisor *= shape[j];
-                    }
-                    if (i == 0) {
-                      os << "_idx / " << divisor;
-                    } else {
-                      os << "(_idx / " << divisor << ") % " << shape[i];
-                    }
-                  }
-                  os << "]";
-                }
-              }
-              os << ");\n";
-
-              reduceIndent();
-              indent();
-              os << "}\n";
-              break;
-            }
-          }
-        }
-      }
+      for (auto &[array, chan] : outputs)
+        emitWriteOut(array, chan);
     }
 
     // Reset state
+    outputMask.clear();
     inArrayFunction = false;
     arrayArgToLocalName.clear();
     arrayArgToChannelName.clear();

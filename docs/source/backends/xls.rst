@@ -74,6 +74,92 @@ Allo supports several approaches to generate HLS code:
 
        mod = s.build(target="xlscc", mode="sw_emu", project="gemm.prj")
 
+   - ``rtl``: Runs ``xlscc`` → ``opt_main`` → ``codegen_main`` and emits vendor-neutral
+     Verilog (no FPGA primitives or IP), suitable for any synthesis tool (e.g., Efinix Efinity, Yosys).
+     The project contains ``<top>_core.v`` (XLS pipeline), ``<top>.v`` (top wrapper that instantiates
+     a RAM model for each external memory), and ``allo_ram.v`` (inferable block-RAM models).
+   - ``cosim``: Same as ``rtl``, then builds a Verilator testbench; calling the module simulates the
+     RTL cycle-accurately and ``mod.cycles`` holds the cycle count.
+
+    .. code-block:: python
+
+       mod = s.build(target="xlscc", mode="cosim", project="gemm.prj", use_memory=True,
+                     configs={"clock_period_ps": 8})
+       np.testing.assert_array_equal(mod(A, B), A @ B)
+
+   XLS binaries are looked up in ``$XLS_BIN`` then ``PATH``; xlscc header directories are taken from
+   ``configs["include_dirs"]`` or ``$XLS_INCLUDE`` (colon separated). They must contain
+   ``xls/contrib/xlscc/synth_only`` and a directory holding ``ac_datatypes/include/ac_int.h``
+   (in a Bazel build, ``external/+ac_types_extension+ac_datatypes``, which needs to be symlinked
+   as ``ac_datatypes``). ``worst_case_throughput`` sets how many cycles may separate proc
+   activations. By default (``throughput_first=True``) the flow first relaxes
+   ``clock_period_ps`` (up to 4x) to reach full throughput, since the unit delay model is
+   pessimistic for FPGA fabric, and only then accepts the reduced throughput suggested by the
+   XLS scheduler. The schedule actually used is stored in ``mod.schedule``. Other ``configs`` keys: ``delay_model``
+   (default ``"unit"``, as XLS has no FPGA delay model, so ``clock_period_ps`` bounds the ops per
+   stage), ``pipeline_stages`` (overrides ``clock_period_ps``), ``reset`` (default ``"rst"``,
+   active-high synchronous), ``use_system_verilog`` (default ``False``), ``xlscc_flags`` (extra
+   xlscc flags) and ``max_cycles``.
+   Streaming designs expose ``v<k>_in`` / ``out`` ready/valid ports; scalar designs expose their
+   arguments plus ``in_vld`` / ``out_vld``.
+
+   The generated RTL can be packaged as an Efinix Efinity project (written to ``<project>/efinity``)
+   and optionally synthesized (``flow="map"``) or placed and routed (``flow="pnr"``), which returns
+   the resource estimate and, after place and route, ``fmax_mhz``. Set ``EFINITY_HOME`` to the
+   Efinity install directory (Efinity's ``setup.sh`` is sourced in a subshell, so it does not
+   replace the Python environment). The project is derived from an example shipped with the
+   installed Efinity release so that it matches its project format.
+
+    .. code-block:: python
+
+       mod = s.build(target="xlscc", mode="rtl", project="vadd.prj", use_memory=True)
+       print(mod.export_efinity(family="Titanium", device="Ti60F225", clock_mhz=200, flow="pnr"))
+       # {'FFs': 269, 'LUTs': 281, 'RAMs': 4, ..., 'fmax_mhz': 320.7}
+
+   Streaming designs also get ``<top>_axis.v``, an AXI4-Stream wrapper (``s_axis_v<k>_in_*`` inputs,
+   ``m_axis_out_*`` output with ``tlast`` on the last word of each result, active-low ``aresetn``)
+   for connecting to DMA engines or an SoC such as Efinix Sapphire. Pass ``interface="axis"`` to
+   ``export_efinity`` to use it as the top-level module. Supported families are ``"Titanium"``
+   (e.g., ``Ti60F225``) and ``"Trion"`` (e.g., ``T20F256``).
+
+   **Data types.** Integer types of any width are supported; channels carry the element type
+   (e.g., 8-bit ports for ``int8``) and cosim results are sign-extended accordingly. Fixed-point
+   types (``Fixed`` / ``UFixed``) are lowered to raw integers in ``rtl`` / ``cosim`` mode, exactly
+   as in the LLVM backend, so results match ``s.build()`` bit for bit; in cosim, real-valued
+   inputs are converted to raw fixed-point bits and outputs back to real values. Floating point is
+   not supported by XLS (and Efinix fabrics have no floating-point hard blocks); use fixed point.
+
+3. **Memories and Partitioning** (``use_memory=True``):
+   Every array becomes an XLS memory backed by a block RAM. ``s.partition`` splits an array into
+   banks: ``Partition.Cyclic`` / ``Partition.Block`` with ``factor=F`` produce ``F`` memories
+   (``<name>_b<k>``); a partition that leaves one element per bank keeps the array in registers.
+   (The current XLS scheduling does not yet exploit banks for extra parallelism; see
+   :doc:`efinix`.) Scalars always stay in registers.
+   XLS cannot see dependences through external RAMs, so a loop that reads and writes the same
+   element at a loop-invariant address (e.g., the accumulator ``C[i, j]`` of a reduction over
+   ``k``) keeps that element in a register for the duration of the loop.
+
+4. **Dataflow Regions**:
+   ``df.build(top, target="xls", mode="rtl" | "cosim", project=...)`` compiles every kernel of a
+   ``@df.region`` into its own XLS module, so kernels run concurrently, and generates a Verilog top
+   that connects each ``Stream`` through a FIFO of the declared depth. Region array arguments read
+   by a kernel are streamed in on ``v<k>_in``; arguments written by a kernel are streamed out on
+   ``v<k>_out`` (row-major). In ``cosim`` mode, calling the module fills the output arguments in
+   place. ``configs`` accepts ``use_memory`` and ``fifo_reg_bits`` (FIFOs up to this size, default
+   1024 bits, are kept in registers; larger ones use block RAM) in addition to the options above.
+   A region argument read by several kernels is broadcast to all of them. When several kernels
+   write the same argument (e.g., each PE of a tiled GEMM updates its own tile of ``C``), every
+   writer streams the whole array together with a per-element "written" bit and the outputs are
+   merged element by element; elements no writer touched are 0. With a single writer, elements it
+   does not write are only preserved if the kernel also reads the argument. Streams must have one
+   producer and one consumer. The returned module also provides ``export_efinity``.
+
+    .. code-block:: python
+
+       mod = df.build(top, target="xls", mode="cosim", project="systolic.prj")
+       mod(A, B, C)  # C is written by the RTL simulation
+       print(mod.export_efinity(family="Trion", device="T20F256", flow="pnr"))
+
 Project Structure and Execution
 -------------------------------
 The generated XLS project (e.g., in the folder ``gemm.prj``) typically includes:

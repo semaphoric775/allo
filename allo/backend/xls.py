@@ -13,10 +13,11 @@ from pathlib import Path
 import numpy as np
 
 from .._mlir.dialects import allo as allo_d
-from .._mlir.ir import Context, Location, Module, UnitAttr
+from .._mlir.ir import Context, InsertionPoint, Location, Module, UnitAttr
 from .._mlir.passmanager import PassManager
 from ..ir.transform import find_func_in_module
 from ..passes import decompose_library_function, _mlir_lower_pipeline
+from . import efinix, xls_rtl
 
 # Regex patterns for floats, dynamic shapes, and fixed-point types
 FLOAT_RE = re.compile(r"\b(f16|f32|f64|bf16)\b")
@@ -138,7 +139,15 @@ def _reindent(body, indent="    "):
 
 def _parse_memory_comments(body):
     # Regex patterns __xls_memory_decl__ and __xls_state_vars__
-    mem_re = re.compile(r"^\s*//\s*__xls_memory_decl__:\s*(.+)$")
+    # The element type may itself contain commas (e.g. "ac_int<12, true>")
+    mem_re = re.compile(
+        r"^\s*//\s*__xls_memory_decl__:\s*(.*?),\s*(\d+),\s*(\w+),\s*(\d+)"
+        r"((?:,\s*\d+)*)"
+    )
+    # Completely partitioned arrays: class-level registers, "type, name, dims"
+    arr_re = re.compile(
+        r"^\s*//\s*__xls_array_decl__:\s*(.*),\s*([A-Za-z_]\w*)((?:,\s*\d+)+)\s*;?\s*$"
+    )
     state_re = re.compile(r"^\s*//\s*__xls_state_vars__:\s*(.+)$")
 
     # Collect memory declarations, state variables.
@@ -148,24 +157,22 @@ def _parse_memory_comments(body):
 
     for line in body.split("\n"):
         mem_m = mem_re.match(line)
+        arr_m = arr_re.match(line)
         state_m = state_re.match(line)
 
-        if mem_m:
-            parts = [
-                p.split(";")[0].split("//")[0].strip()
-                for p in mem_m.group(1).split(",")
-            ]
+        if arr_m:
+            elem_type, name = arr_m.group(1).strip(), arr_m.group(2)
+            shape = "".join(f"[{d}]" for d in re.findall(r"\d+", arr_m.group(3)))
+            decls.append(f"{elem_type} {name}{shape};")
+        elif mem_m:
             # Format: elem_type, size, name, memory_space, dim0, dim1, ...
-            if len(parts) < 4:
-                continue  # Invalid format, skip
-
             elem_type, size_str, name, mem_space_str = (
-                parts[0],
-                parts[1],
-                parts[2],
-                parts[3],
+                mem_m.group(1).strip(),
+                mem_m.group(2),
+                mem_m.group(3),
+                mem_m.group(4),
             )
-            dims = [d for d in parts[4:] if d]
+            dims = re.findall(r"\d+", mem_m.group(5))
 
             decls.append(f"__xls_memory<{elem_type}, {size_str}> {name};")
 
@@ -289,16 +296,23 @@ def _gen_textproto(mems):
 
 # Render TestBlock class with channels and optional memory/state declarations.
 def _render_testblock(
-    in_chans, out_chans, body, top_name, mem_decls=None, state_decls=None
+    in_chans,
+    out_chans,
+    body,
+    top_name,
+    mem_decls=None,
+    state_decls=None,
+    *,
+    chan_types=None,
 ):
+    # Templated channels for inputs and outputs (element type, default int)
+    types = chan_types or {}
 
-    # Templated channels for inputs and outputs
-    in_decl = "\n  ".join(
-        f"__xls_channel<int, __xls_channel_dir_In> {c};" for c in in_chans
-    )
-    out_decl = "\n  ".join(
-        f"__xls_channel<int, __xls_channel_dir_Out> {c};" for c in out_chans
-    )
+    def decl(chan, direction):
+        return f"__xls_channel<{types.get(chan, 'int')}, __xls_channel_dir_{direction}> {chan};"
+
+    in_decl = "\n  ".join(decl(c, "In") for c in in_chans)
+    out_decl = "\n  ".join(decl(c, "Out") for c in out_chans)
     indented = _reindent(body)  # reindent body to match TestBlock class indentation
 
     mem_section = ""
@@ -322,13 +336,74 @@ public:
 """
 
 
-def _wrap_xlscc(core_code, top_name, func_name, inputs, use_memory):
-    # No array inputs -> combinational, return without channels, memory, TestBlock class
-    if not inputs:
-        return core_code, ""
+FIXED_INFO_RE = re.compile(r"!allo\.(U?)Fixed<(\d+),\s*(\d+)>")
+FIXED_ANY_RE = re.compile(r"!allo\.U?Fixed<(\d+),\s*\d+>")
 
-    # Extract function body and headers
+
+def _fixed_info(type_str):
+    """(signed, width, frac) of a fixed-point (element) type, else ()."""
+    m = FIXED_INFO_RE.search(type_str)
+    return (not m.group(1), int(m.group(2)), int(m.group(3))) if m else ()
+
+
+def _cast_stream_puts(module):
+    """Convert values put into fixed-point streams to the stream's element type.
+
+    The frontend may put e.g. a Fixed<32, 16> product into a Fixed<16, 8>
+    stream, relying on C++ assignment; once fixed-point is lowered to raw
+    integers the conversion has to be explicit.
+    """
+    puts = []
+
+    def walk(op):
+        for region in op.regions:
+            for block in region.blocks:
+                for inner in block.operations:
+                    if inner.operation.name == "allo.stream_put":
+                        puts.append(inner)
+                    walk(inner.operation)
+
+    walk(module.operation)
+    for put in puts:
+        value = put.operands[-1]
+        elem = allo_d.StreamType(put.operands[0].type).base_type
+        if value.type == elem or not FIXED_INFO_RE.search(str(elem)):
+            continue
+        cast_op = (
+            allo_d.FixedToFixedOp
+            if FIXED_INFO_RE.search(str(value.type))
+            else allo_d.IntToFixedOp
+        )
+        with InsertionPoint(put):
+            cast = cast_op(elem, value)
+        put.operands[len(put.operands) - 1] = cast.result
+
+
+def _channel_ctype(type_str, hint):
+    """C++ type carried by a channel for an MLIR memref/tensor element type."""
+    m = re.search(r"<(?:\d+x)*u?i(\d+)\b", type_str)
+    if not m:
+        return "int"  # index / fixed-point: keep the integer interface
+    width, signed = int(m.group(1)), hint != "u"
+    if width == 32 and signed:
+        return "int"
+    return f"ac_int<{width}, {'true' if signed else 'false'}>"
+
+
+# Channels announced by the emitter for dataflow kernels: "type, name, In|Out"
+CHAN_DECL_RE = re.compile(
+    r"^\s*//\s*__xls_chan_decl__:\s*(.*),\s*([A-Za-z_]\w*),\s*(In|Out)\s*$", re.M
+)
+
+
+def _wrap_xlscc(core_code, top_name, func_name, inputs, use_memory, *, chan_types=None):
     body = _extract_body(core_code, func_name)
+    chans = CHAN_DECL_RE.findall(body)
+    # No array inputs -> combinational, return without channels, memory, TestBlock class
+    if not inputs and not chans:
+        return core_code, "", []
+
+    # Extract headers
     match = re.search(rf"void\s+{re.escape(func_name)}\s*\(\s*\)\s*\{{", core_code)
     headers = core_code[: match.start()] if match else ""
 
@@ -338,18 +413,31 @@ def _wrap_xlscc(core_code, top_name, func_name, inputs, use_memory):
     # Generate channel names
     in_chans = [f"v{i}_in" for i in range(len(inputs))]
     out_chans = ["out"]
+    if chans:  # dataflow kernel: exactly the channels the emitter declared
+        in_chans = [n for _, n, d in chans if d == "In"]
+        out_chans = [n for _, n, d in chans if d == "Out"]
+        chan_types = {n: t.strip() for t, n, _ in chans}
 
     # Render testblock
     if use_memory:
         testblock = _render_testblock(
-            in_chans, out_chans, result, top_name, mem_decls, state_decls
+            in_chans,
+            out_chans,
+            result,
+            top_name,
+            mem_decls,
+            state_decls,
+            chan_types=chan_types,
         )
         textproto = _gen_textproto(mems)
     else:
-        testblock = _render_testblock(in_chans, out_chans, body, top_name)
+        testblock = _render_testblock(
+            in_chans, out_chans, body, top_name, chan_types=chan_types
+        )
         textproto = ""
+        mems = []
 
-    return headers + testblock, textproto
+    return headers + testblock, textproto, mems
 
 
 class XLSCCModule:  # pylint: disable=too-many-instance-attributes
@@ -360,8 +448,11 @@ class XLSCCModule:  # pylint: disable=too-many-instance-attributes
         project=None,
         use_memory=False,
         mode=None,
+        *,
+        configs=None,
     ):
         self.top_func_name = top_func_name
+        self.configs = {**xls_rtl.DEFAULT_RTL_CONFIGS, **(configs or {})}
         self.project = project
         self.use_memory = use_memory
         self.mode = mode
@@ -370,6 +461,7 @@ class XLSCCModule:  # pylint: disable=too-many-instance-attributes
         self._arg_info = []
         self._has_arrays = False
         self._output_info = None
+        self.rtl_sources = []
 
         # Parse MLIR + run minimal lowering
         with Context() as ctx, Location.unknown():
@@ -388,6 +480,27 @@ class XLSCCModule:  # pylint: disable=too-many-instance-attributes
             pm.run(self.module.operation)
 
             self.func = find_func_in_module(self.module, top_func_name)
+            # Fixed-point interface types, recorded before they are lowered
+            self._fixed_args, self._fixed_out, self._out_frac = [], None, None
+            if self.func:
+                self._fixed_args = [
+                    _fixed_info(str(a.type)) for a in self.func.arguments
+                ]
+                results = list(self.func.type.results)
+                fixed_out = _fixed_info(str(results[0])) if results else ()
+                self._fixed_out = fixed_out
+                # fraction bits of a fixed-point result (None otherwise)
+                self._out_frac = fixed_out[2] if fixed_out else None
+            if mode in {"rtl", "cosim"}:
+                # Hardware carries fixed-point values as raw integers (the same
+                # lowering the LLVM backend uses, so results match bit for bit)
+                _cast_stream_puts(self.module)
+                allo_d.lower_fixed_to_int(self.module)
+                # the pass leaves stream element types (and stream_get/put
+                # signatures) alone; their values are raw integers by now
+                text = FIXED_ANY_RE.sub(r"i\1", str(self.module))
+                self.module = Module.parse(text, ctx)
+                self.func = find_func_in_module(self.module, top_func_name)
             if self.func:
                 self.func.attributes["top"] = UnitAttr.get()
 
@@ -405,13 +518,23 @@ class XLSCCModule:  # pylint: disable=too-many-instance-attributes
         # Extract argument info for sw_emu
         self._extract_arg_info()
 
-        # Get array parameter names
+        # Get array parameter names and the element type each channel carries
         param_names = []
+        chan_types = {}
         if self.func:
-            for arg in self.func.arguments:
+            itypes = self._type_hints("itypes")
+            for i, arg in enumerate(self.func.arguments):
                 t = str(arg.type)
                 if ("memref" in t or "tensor" in t) and "stream" not in t.lower():
+                    chan_types[f"v{len(param_names)}_in"] = _channel_ctype(
+                        t, itypes[i] if i < len(itypes) else "s"
+                    )
                     param_names.append(f"arg{len(param_names)}")
+            results = list(self.func.type.results)
+            if results:
+                chan_types["out"] = _channel_ctype(
+                    str(results[0]), (self._type_hints("otypes") or "s")[0]
+                )
 
         # Add fixed-point struct if needed
         fixed_header = (
@@ -420,8 +543,13 @@ class XLSCCModule:  # pylint: disable=too-many-instance-attributes
 
         # Use _wrap_xlscc to handle C++ templated memory/channels, headers, top pragma, etc. as well
         # as RAM Configuration File (rewrites.textproto) which are not handled by emit_xls
-        cpp, self.rewrites_textproto = _wrap_xlscc(
-            self.core_code, top_func_name, top_func_name, param_names, use_memory
+        cpp, self.rewrites_textproto, self.mems = _wrap_xlscc(
+            self.core_code,
+            top_func_name,
+            top_func_name,
+            param_names,
+            use_memory,
+            chan_types=chan_types,
         )
         self.final_cpp = fixed_header + cpp
 
@@ -437,6 +565,106 @@ class XLSCCModule:  # pylint: disable=too-many-instance-attributes
         # Build sw_emu binary if requested
         if mode == "sw_emu":
             self._build_sw_emu()
+        elif mode in {"rtl", "cosim"}:
+            self._build_rtl()
+            if mode == "cosim":
+                self._build_cosim()
+
+    def _build_rtl(self):
+        """xlscc -> opt_main -> codegen_main, then wrap with RAM models."""
+        project = self.project or tempfile.mkdtemp(prefix="xls_rtl_")
+        self._project_dir = project
+        os.makedirs(project, exist_ok=True)
+        cpp_path = os.path.join(project, "test_block.cpp")
+        with open(cpp_path, "w", encoding="utf-8") as f:
+            f.write(self.final_cpp)
+        rewrites = None
+        if self.rewrites_textproto:
+            rewrites = os.path.join(project, "rewrites.textproto")
+            with open(rewrites, "w", encoding="utf-8") as f:
+                f.write(self.rewrites_textproto)
+        self._is_stream = "class TestBlock" in self.final_cpp
+        ir = xls_rtl.cpp_to_ir(
+            cpp_path,
+            project,
+            self._is_stream,
+            self.configs["include_dirs"],
+            self.configs["xlscc_flags"],
+        )
+        mems = [
+            (name, STORAGE_TYPE_TO_XLS_RAM[code], size)
+            for name, _, size, _, code in self.mems
+        ]
+        core = f"{self.top_func_name}_core"
+        core_v, self.schedule = xls_rtl.ir_to_verilog(
+            ir,
+            project,
+            core,
+            self.configs,
+            rewrites=rewrites,
+            mems=[m[:2] for m in mems],
+        )
+        with open(core_v, encoding="utf-8") as f:
+            self.core_ports = xls_rtl.parse_ports(f.read(), core)
+        top_v = os.path.join(project, f"{self.top_func_name}.v")
+        self.verilog = xls_rtl.gen_top(core, self.core_ports, mems, self.top_func_name)
+        with open(top_v, "w", encoding="utf-8") as f:
+            f.write(self.verilog)
+        ram_v = shutil.copy(xls_rtl.RTL_HARNESS / "allo_ram.v", project)
+        self.rtl_sources = [core_v, top_v, ram_v]
+        self.top_ports = xls_rtl.parse_ports(self.verilog, self.top_func_name)
+        self.axis_source = None
+        if self._is_stream:
+            # AXI4-Stream view for DMA / SoC integration (e.g. Efinix Sapphire)
+            self.axis_source = os.path.join(project, f"{self.top_func_name}_axis.v")
+            with open(self.axis_source, "w", encoding="utf-8") as f:
+                f.write(
+                    xls_rtl.gen_axis_wrapper(
+                        self.top_func_name,
+                        self.top_ports,
+                        (self._output_info or {"size": 1})["size"],
+                        self.configs["reset"],
+                    )
+                )
+
+    def _build_cosim(self):
+        if shutil.which("verilator") is None:
+            raise RuntimeError("verilator not found. Cannot build cosim.")
+        ctrl = {"clk", self.configs["reset"], "in_vld"}
+        if self._is_stream:
+            n_in = [a["size"] for a in self._arg_info if a["is_array"]]
+            ins = [f"v{k}_in" for k in range(len(n_in))]
+            out, n_out = "out", (self._output_info or {"size": 1})["size"]
+        else:
+            ins = [n for d, n, _ in self.top_ports if d == "input" and n not in ctrl]
+            outs = [n for d, n, _ in self.top_ports if d == "output" and n != "out_vld"]
+            n_in, out, n_out = [1] * len(ins), outs[0], 1
+        self._out_width = {n: w for _, n, w in self.top_ports}[out]
+        self._out_signed = (self._type_hints("otypes") or "s")[0] != "u"
+        tb = os.path.join(self._project_dir, "tb.cpp")
+        with open(tb, "w", encoding="utf-8") as f:
+            f.write(
+                xls_rtl.gen_tb(
+                    self.top_func_name,
+                    self.top_ports,
+                    ins,
+                    out,
+                    n_in=n_in,
+                    n_out=n_out,
+                    stream=self._is_stream,
+                    reset=self.configs["reset"],
+                    max_cycles=self.configs["max_cycles"],
+                )
+            )
+        self._binary_path = xls_rtl.build_cosim(
+            self._project_dir, self.top_func_name, self.rtl_sources, tb
+        )
+
+    def _type_hints(self, attr):
+        """Per-argument signedness hints ("s"/"u"/"_") attached by the builder."""
+        if self.func and attr in self.func.attributes:
+            return str(self.func.attributes[attr]).strip('"')
+        return ""
 
     def _extract_arg_info(self):
         if not self.func:
@@ -449,15 +677,15 @@ class XLSCCModule:  # pylint: disable=too-many-instance-attributes
             if "memref" in t or "tensor" in t:
                 info["is_array"] = True
                 self._has_arrays = True
-                match = re.search(r"<([^>]+)>", t)
+                match = re.search(r"<((?:\d+x)+)([^,>]+(?:<[^>]*>)?)", t)
                 if match:
-                    parts = match.group(1).split("x")
-                    if len(parts) >= 2:
-                        info["shape"] = [int(p) for p in parts[:-1]]
-                        info["dtype"] = parts[-1]
-                        info["size"] = 1
-                        for dim in info["shape"]:
-                            info["size"] *= dim
+                    info["shape"] = [
+                        int(p) for p in match.group(1).rstrip("x").split("x")
+                    ]
+                    info["dtype"] = match.group(2)
+                    info["size"] = 1
+                    for dim in info["shape"]:
+                        info["size"] *= dim
             else:
                 info["dtype"] = t
 
@@ -693,8 +921,10 @@ help:
         self._binary_path = binary_path
 
     def __call__(self, *args):
+        if self.mode == "cosim":
+            return self._call_cosim(*args)
         if self.mode != "sw_emu":
-            raise RuntimeError("__call__ only supported in sw_emu mode")
+            raise RuntimeError("__call__ only supported in sw_emu and cosim modes")
         if not self._binary_path or not os.path.exists(self._binary_path):
             raise RuntimeError("sw_emu binary not built")
 
@@ -751,6 +981,68 @@ help:
                     )
                 return np.array(vals, dtype=np.int32)
         return None
+
+    def export_efinity(
+        self, family="Titanium", device="Ti60F225", flow=None, interface="native", **kw
+    ):
+        """Write an Efinity project for the generated RTL to ``<project>/efinity``.
+
+        ``interface``: "native" (XLS ready/valid ports) or "axis" (AXI4-Stream,
+        streaming designs only). ``flow`` ("map" or "pnr") optionally runs
+        Efinity and returns its resource report (and ``fmax_mhz`` after pnr);
+        otherwise returns the project XML path. ``kw``: ``timing_model``,
+        ``clock_mhz``.
+        """
+        if not self.rtl_sources:
+            raise RuntimeError("export_efinity requires mode='rtl' or 'cosim'")
+        top, sources = self.top_func_name, list(self.rtl_sources)
+        if interface == "axis":
+            if not self.axis_source:
+                raise RuntimeError("AXI4-Stream interface needs a streaming design")
+            top, sources = f"{top}_axis", sources + [self.axis_source]
+            kw.setdefault("clock_port", "aclk")
+        elif interface != "native":
+            raise ValueError(f"Unknown interface {interface!r}")
+        out = os.path.join(self._project_dir, "efinity")
+        xml = efinix.gen_project(out, top, sources, family=family, device=device, **kw)
+        return efinix.run_flow(out, top, flow) if flow else xml
+
+    def _call_cosim(self, *args):
+        # Inputs are numbered per channel: arrays when streaming, scalars otherwise
+        vals = [
+            a for a, i in zip(args, self._arg_info) if i["is_array"] == self._is_stream
+        ]
+        fixed = [
+            f
+            for f, i in zip(self._fixed_args, self._arg_info)
+            if i["is_array"] == self._is_stream
+        ]
+        for k, arg in enumerate(vals):
+            if k < len(fixed) and fixed[k]:  # real value -> raw fixed-point bits
+                arg = np.fix(np.asarray(arg, np.float64) * 2 ** fixed[k][2])
+            arr = np.asarray(arg).astype(np.int64).flatten()
+            arr.tofile(os.path.join(self._project_dir, f"input{k}.data"))
+        res = subprocess.run(
+            [self._binary_path],
+            cwd=self._project_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(f"cosim failed:\n{res.stderr}{res.stdout}")
+        m = re.search(r"CYCLES:(\d+)", res.stdout)
+        self.cycles = int(m.group(1)) if m else None
+        out = np.fromfile(os.path.join(self._project_dir, "output.data"), np.int64)
+        # The testbench zero-extends the output port; restore the sign
+        w = self._out_width
+        if self._out_signed and w < 64:
+            out = np.where(out >= (1 << (w - 1)), out - (1 << w), out)
+        if self._fixed_out:
+            out = out.astype(np.float64) / 2**self._out_frac
+        if not self._is_stream:
+            return float(out[0]) if self._fixed_out else int(out[0])
+        return out.reshape(self._output_info["shape"]) if self._output_info else out
 
     def __repr__(self):
         return self.final_cpp

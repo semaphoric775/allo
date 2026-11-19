@@ -2286,7 +2286,7 @@ void allo::hls::VhlsModuleEmitter::emitCast(CastOpType op) {
   fixUnsignedType(result, op->hasAttr("unsigned"));
   emitValue(result);
   os << " = ";
-  emitValue(op.getOperand());
+  emitCastOperand(op.getOperand(), result);
   os << ";";
   emitInfoAndNewLine(op);
 }

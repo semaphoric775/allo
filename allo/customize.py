@@ -1342,6 +1342,7 @@ class Schedule:
                 project=project,
                 use_memory=use_memory,
                 mode=mode,
+                configs=configs,
             )
         if target in {
             "vhls",
